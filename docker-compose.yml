@@ -1,0 +1,63 @@
+version: '3.8'
+
+services:
+  livekit:
+    image: livekit/livekit-server:latest
+    restart: unless-stopped
+    command: --dev --bind 0.0.0.0
+    ports:
+      - "7880:7880"
+      - "7881:7881"
+      - "50000-50100:50000-50100/udp"
+    environment:
+      LIVEKIT_KEYS: "devkey:secret"
+
+  web:
+    build:
+      context: ./okktrainer/web
+    restart: unless-stopped
+    environment:
+      LIVEKIT_URL: "ws://livekit:7880"            # сервер-сервер
+      LIVEKIT_API_KEY: "devkey"
+      LIVEKIT_API_SECRET: "secret"
+      NEXT_PUBLIC_LIVEKIT_URL: "wss://okktrainerlive.duckdns.org"  # браузер
+    depends_on:
+      - livekit
+
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "11434:11434"   # опционально, можно не публиковать наружу
+    volumes:
+      - ollama:/root/.ollama
+
+  ai:
+    build:
+      context: ./okktrainer/ai
+    restart: unless-stopped
+    environment:
+      LIVEKIT_URL: "ws://livekit:7880"
+      LIVEKIT_API_KEY: "devkey"
+      LIVEKIT_API_SECRET: "secret"
+
+      ROOM_NAME: "sales-room"
+      IDENTITY: "patient-ai"
+
+      # Ollama (OpenAI-compatible endpoint /v1 по умолчанию у LK Ollama плагина)
+      OLLAMA_BASE_URL: "http://ollama:11434/v1"
+      OLLAMA_MODEL: "llama3.1:8b"
+
+      # STT/TTS локально
+      WHISPER_MODEL_SIZE: "small"   # tiny/base/small/medium/large-v3
+      WHISPER_DEVICE: "cpu"         # cpu или cuda
+      PIPER_MODEL_PATH: "/models/piper/en_US-ryan-high.onnx"
+
+    volumes:
+      - ./okktrainer/ai/models:/models:ro
+    depends_on:
+      - livekit
+      - ollama
+
+volumes:
+  ollama:

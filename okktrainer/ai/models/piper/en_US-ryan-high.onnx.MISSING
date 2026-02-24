@@ -1,0 +1,8 @@
+THIS FILE IS A PLACEHOLDER — the real ONNX model is not included.
+
+Please download or copy the Piper model binary to:
+
+  ./okktrainer/ai/models/piper/en_US-ryan-high.onnx
+
+The Docker setup mounts ./okktrainer/ai/models into the container as /models (read-only).
+Ensure the file is the correct Piper ONNX model expected by your TTS pipeline.

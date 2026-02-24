@@ -1,0 +1,6 @@
+{
+  "name": "en_US-ryan-high",
+  "format": "onnx",
+  "notes": "Placeholder metadata. Place the real en_US-ryan-high.onnx binary next to this file.",
+  "source": "Provide your Piper ONNX model here (not included)."
+}
