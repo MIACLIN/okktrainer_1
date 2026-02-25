@@ -1,7 +1,17 @@
-﻿.venv/
+﻿# macOS
+.DS_Store
+
+# logs
+*.log
+
+# models
+agent/models/
+
+# python
+.venv/
 __pycache__/
-node_modules/
-.env
 *.pyc
+
+# node
+node_modules/
 .next/
-dist/

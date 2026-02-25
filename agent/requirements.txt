@@ -1,0 +1,4 @@
+python-dotenv==1.0.1
+aiohttp==3.10.11
+vosk==0.3.44
+livekit==0.15.0

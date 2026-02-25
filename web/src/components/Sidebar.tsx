@@ -79,7 +79,7 @@ export function Sidebar({
               className="navItem"
               onClick={() => setActive(it.key)}
               style={{
-                background: active === it.key ? "rgba(168, 85, 247, 0.14)" : undefined,
+                background: active === it.key ? "rgba(85, 109, 247, 0.14)" : undefined,
                 borderColor: active === it.key ? "rgba(168, 85, 247, 0.24)" : undefined,
               }}
             >

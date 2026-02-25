@@ -3,8 +3,8 @@ import type { Metadata } from "next";
 import AppShell from "./shell";
 
 export const metadata: Metadata = {
-  title: "OKK Trainer",
-  description: "Тренажёр звонков (LiveKit)",
+  title: "OKK",
+  description: "Тренажёр звонков",
 };
 
 export default function RootLayout({

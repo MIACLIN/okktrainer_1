@@ -10,7 +10,7 @@ services:
       - "7881:7881"
       - "50000-50100:50000-50100/udp"
     environment:
-      LIVEKIT_KEYS: "devkey:secret"
+      LIVEKIT_KEYS: "devkey: secret"
 
   web:
     build:

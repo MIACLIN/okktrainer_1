@@ -1,443 +1,508 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
-import { useSearchParams } from "next/navigation";
+import { useSearchParams, useRouter } from "next/navigation";
 
-type ConnState = "idle" | "fetching_token" | "connecting" | "connected" | "error";
-type TLine = { t: string; role: "you" | "client"; text: string };
+import {
+  Room,
+  RoomEvent,
+  Track,
+  createLocalAudioTrack,
+  type RemoteParticipant,
+} from "livekit-client";
 
-type DataMsg =
-  | { type: "transcript"; role?: "you" | "client"; text: string; t?: string }
-  | { type: "status"; text: string }
-  | { type: string; [k: string]: any };
+type Role = "client" | "manager" | "system";
+type TranscriptItem = { id: string; role: Role; text: string; t?: string };
+
+function uid() {
+  return Math.random().toString(16).slice(2) + Date.now().toString(16);
+}
 
 export default function CallPage() {
   const sp = useSearchParams();
-  const client = (sp.get("client") || "easy") as string;
+  const router = useRouter();
 
+  const client = (sp.get("client") ?? "easy") as "easy" | "medium" | "hard";
+  const scenario = sp.get("scenario") ?? ""; // пока не используется, оставил
+
+  // room naming: okk-easy / okk-medium / okk-hard
   const roomName = useMemo(() => `okk-${client}`, [client]);
-  const identity = useMemo(
-    () => `manager-${Math.random().toString(16).slice(2, 8)}`,
-    []
-  );
 
-  const [conn, setConn] = useState<ConnState>("idle");
-  const [err, setErr] = useState<string | null>(null);
+  // ✅ LiveKit server URL из env
+  const serverUrl = process.env.NEXT_PUBLIC_LIVEKIT_URL;
 
-  const [lkRoom, setLkRoom] = useState<any>(null);
-  const roomRef = useRef<any>(null);
+  // LiveKit state
+  const roomRef = useRef<Room | null>(null);
+  const localTrackRef = useRef<Track.LocalAudioTrack | null>(null);
 
-  const [micEnabled, setMicEnabled] = useState(true);
-  const [status, setStatus] = useState("Готов к подключению");
-  const [transcript, setTranscript] = useState<TLine[]>([
+  const [connected, setConnected] = useState(false);
+  const [connecting, setConnecting] = useState(false);
+  const [micOn, setMicOn] = useState(true);
+
+  const [dataChannelReady, setDataChannelReady] = useState(false);
+  const [remoteAudioPresent, setRemoteAudioPresent] = useState(false);
+
+  const [identity] = useState<string>(() => `manager-${uid().slice(0, 5)}`);
+  const [transcript, setTranscript] = useState<TranscriptItem[]>([
     {
-      t: new Date().toLocaleTimeString(),
+      id: uid(),
       role: "client",
       text: "Привет. Расскажите, что вы предлагаете?",
+      t: new Date().toLocaleTimeString(),
     },
   ]);
 
-  function addLine(role: "you" | "client", text: string, t?: string) {
+  const [lastEvent, setLastEvent] = useState<string>("Готов к подключению");
+  const [error, setError] = useState<string | null>(null);
+
+  function pushTranscript(role: Role, text: string) {
     setTranscript((prev) => [
       ...prev,
-      { t: t || new Date().toLocaleTimeString(), role, text },
+      { id: uid(), role, text, t: new Date().toLocaleTimeString() },
     ]);
   }
 
   async function connect() {
-    try {
-      setErr(null);
-      setConn("fetching_token");
-      setStatus("Получаем токен...");
+    setError(null);
 
-      // 1) token API (у тебя уже есть этот endpoint)
-      const r = await fetch("/api/livekit/token", {
+    // ✅ жёсткая проверка: без wsUrl LiveKit не подключится
+    if (!serverUrl) {
+      setError("NEXT_PUBLIC_LIVEKIT_URL не задан в .env.local");
+      setLastEvent("Ошибка конфигурации");
+      return;
+    }
+    if (!/^wss?:\/\//.test(serverUrl)) {
+      setError(`NEXT_PUBLIC_LIVEKIT_URL должен начинаться с ws:// или wss:// (сейчас: ${serverUrl})`);
+      setLastEvent("Ошибка конфигурации");
+      return;
+    }
+
+    setConnecting(true);
+    setLastEvent("Запрашиваю токен…");
+
+    try {
+      // ✅ Токен запрашиваем POST-ом
+      const res = await fetch("/api/livekit/token", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          room: roomName,
-          identity,
-          name: "Manager",
-        }),
+        body: JSON.stringify({ room: roomName, identity }),
       });
 
-      if (!r.ok) {
-        const text = await r.text().catch(() => "");
-        throw new Error(`Token API error: ${r.status}. ${text}`);
-      }
+      if (!res.ok) throw new Error(`token endpoint failed: ${res.status}`);
+      const data = await res.json();
+      const token = data?.token;
+      if (!token) throw new Error("token endpoint вернул пустой token");
 
-      const data = (await r.json()) as { token: string; url: string };
-      if (!data?.token || !data?.url) throw new Error("Invalid token response");
+      setLastEvent("Подключаюсь к LiveKit…");
 
-      setConn("connecting");
-      setStatus("Подключаемся к комнате...");
-
-      // 2) connect to LiveKit
-      const lk = await import("livekit-client");
-      const room = new lk.Room({ adaptiveStream: true, dynacast: true });
-
-      // events
-      room.on(lk.RoomEvent.Connected, () => {
-        setConn("connected");
-        setStatus(`Подключено: ${roomName}`);
+      const room = new Room({
+        adaptiveStream: true,
+        dynacast: true,
       });
-
-      room.on(lk.RoomEvent.Disconnected, () => {
-        setConn("idle");
-        setStatus("Отключено");
-        setLkRoom(null);
-        roomRef.current = null;
-      });
-
-      room.on(
-        lk.RoomEvent.DataReceived,
-        (payload: Uint8Array, _participant: any) => {
-          // ожидаем JSON: {type:"transcript", text:"...", role:"client"|"you", t:"12:34:56"}
-          try {
-            const txt = new TextDecoder().decode(payload);
-            const msg = JSON.parse(txt) as DataMsg;
-
-            if (msg.type === "transcript" && typeof msg.text === "string") {
-              addLine(msg.role || "client", msg.text, msg.t);
-              return;
-            }
-
-            if (msg.type === "status" && typeof msg.text === "string") {
-              setStatus(msg.text);
-              return;
-            }
-          } catch {
-            // ignore non-json
-          }
-        }
-      );
-
-      await room.connect(data.url, data.token);
-
-      // сохранить
       roomRef.current = room;
-      setLkRoom(room);
 
-      // mic on by default
-      await room.localParticipant.setMicrophoneEnabled(true);
-      setMicEnabled(true);
+      // listeners
+      room.on(RoomEvent.Connected, () => {
+        setConnected(true);
+        setConnecting(false);
+        setLastEvent("Подключено");
+      });
 
-      // optional debug
-      // eslint-disable-next-line no-console
-      console.log("Connected:", room.name, room.sid);
+      room.on(RoomEvent.Disconnected, () => {
+        setConnected(false);
+        setConnecting(false);
+        setDataChannelReady(false);
+        setRemoteAudioPresent(false);
+        setLastEvent("Отключено");
+      });
+
+      room.on(RoomEvent.DataReceived, (payload, participant) => {
+        setDataChannelReady(true);
+
+        try {
+          const msg = JSON.parse(new TextDecoder().decode(payload));
+          if (msg?.type === "transcript" && msg?.text) {
+            pushTranscript(msg.role === "manager" ? "manager" : "client", msg.text);
+            setLastEvent(
+              `data: ${participant?.identity ?? "unknown"} → ${String(msg.role ?? "")}`
+            );
+          } else {
+            setLastEvent("data: непонятное сообщение");
+          }
+        } catch {
+          setLastEvent("data: не JSON");
+        }
+      });
+
+      room.on(RoomEvent.ParticipantConnected, (p: RemoteParticipant) => {
+        setLastEvent(`Участник подключён: ${p.identity}`);
+      });
+
+      room.on(RoomEvent.TrackSubscribed, (track) => {
+        if (track.kind === Track.Kind.Audio) setRemoteAudioPresent(true);
+      });
+
+      // ✅ ВАЖНО: тут было url (не определено). Должно быть serverUrl.
+      await room.connect(serverUrl, token);
+
+      // local mic
+      setLastEvent("Включаю микрофон…");
+      const micTrack = await createLocalAudioTrack();
+      localTrackRef.current = micTrack;
+
+      await room.localParticipant.publishTrack(micTrack);
+      micTrack.mute(!micOn);
+
+      setLastEvent("Готово: говорите");
     } catch (e: any) {
-      setConn("error");
-      setStatus("Ошибка подключения");
-      setErr(e?.message || String(e));
+      setConnecting(false);
+      setConnected(false);
+      setError(e?.message ?? "connect error");
+      setLastEvent("Ошибка подключения");
     }
   }
 
   async function disconnect() {
-    try {
-      const r = roomRef.current || lkRoom;
-      if (r) r.disconnect();
-      roomRef.current = null;
-      setLkRoom(null);
-      setConn("idle");
-      setStatus("Отключено");
-    } catch {}
-  }
+    setError(null);
+    setLastEvent("Завершаю…");
 
-  async function toggleMic() {
     try {
-      const r = roomRef.current || lkRoom;
-      if (!r) return;
-      const next = !micEnabled;
-      await r.localParticipant.setMicrophoneEnabled(next);
-      setMicEnabled(next);
-    } catch (e: any) {
-      setErr(e?.message || String(e));
+      const room = roomRef.current;
+
+      if (localTrackRef.current) {
+        try {
+          await room?.localParticipant.unpublishTrack(localTrackRef.current);
+        } catch {}
+        localTrackRef.current.stop();
+        localTrackRef.current = null;
+      }
+
+      room?.disconnect();
+      roomRef.current = null;
+    } finally {
+      setConnected(false);
+      setConnecting(false);
+      setDataChannelReady(false);
+      setRemoteAudioPresent(false);
+      setLastEvent("Завершено");
     }
   }
 
+  function toggleMic() {
+    setMicOn((v) => !v);
+  }
+
+  useEffect(() => {
+    const track = localTrackRef.current;
+    if (track) track.mute(!micOn);
+  }, [micOn]);
+
   useEffect(() => {
     return () => {
-      try {
-        const r = roomRef.current || lkRoom;
-        if (r) r.disconnect();
-      } catch {}
+      // eslint-disable-next-line @typescript-eslint/no-floating-promises
+      disconnect();
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  // кнопки-заглушки оставить для ручного теста UI
-  function addDemoYou() {
-    addLine("you", "Здравствуйте! Давайте уточню вашу задачу…");
-  }
-  function addDemoClient() {
-    addLine("client", "Мне важно понять цену и чем вы лучше.");
-  }
-
   return (
-    <main style={{ padding: 26 }}>
-      <div style={styles.header}>
-        <div>
-          <div style={styles.hTitle}>Звонок</div>
-          <div style={styles.hSub}>
-            Клиент: <b>{client}</b> · Комната: <b>{roomName}</b> · Identity:{" "}
-            <b>{identity}</b>
-          </div>
-        </div>
+    <div style={{ minHeight: "100vh", background: "#F6F7FB", display: "flex" }}>
+      <div style={{ flex: 1, padding: 20 }}>
+        <div
+          style={{
+            display: "flex",
+            alignItems: "flex-start",
+            gap: 14,
+            marginBottom: 14,
+          }}
+        >
+          <div style={{ flex: 1 }}>
+            <div style={{ fontSize: 34, fontWeight: 900, letterSpacing: -0.4 }}>
+              Звонок
+            </div>
+            <div style={{ color: "#667085", marginTop: 4, fontSize: 14 }}>
+              Клиент: <b>{client}</b> · Комната: <b>{roomName}</b> · Identity:{" "}
+              <b>{identity}</b>
+            </div>
 
-        <div style={styles.actions}>
-          {conn !== "connected" ? (
-            <button
-              style={styles.primaryBtn}
-              onClick={connect}
-              disabled={conn === "fetching_token" || conn === "connecting"}
-            >
-              {conn === "fetching_token"
-                ? "Токен..."
-                : conn === "connecting"
-                ? "Подключение..."
-                : "Подключиться"}
-            </button>
-          ) : (
-            <button style={styles.dangerBtn} onClick={disconnect}>
-              Завершить
-            </button>
-          )}
-
-          <button
-            style={{
-              ...styles.secondaryBtn,
-              opacity: conn === "connected" ? 1 : 0.5,
-              cursor: conn === "connected" ? "pointer" : "not-allowed",
-            }}
-            onClick={toggleMic}
-            disabled={conn !== "connected"}
-          >
-            {micEnabled ? "Микрофон: Вкл" : "Микрофон: Выкл"}
-          </button>
-        </div>
-      </div>
-
-      <div style={styles.statusRow}>
-        <span style={styles.pill}>{status}</span>
-        {err && <span style={styles.errPill}>{err}</span>}
-      </div>
-
-      <div style={styles.grid}>
-        <section style={styles.panel}>
-          <div style={styles.panelTitle}>Сеанс</div>
-
-          <div style={styles.callStage}>
-            <div style={styles.avatarBig}>🎧</div>
-            <div style={styles.stageText}>
-              {conn === "connected"
-                ? "Вы в комнате. Говорите — агент должен отвечать."
-                : "Подключитесь, чтобы начать звонок."}
+            <div style={{ marginTop: 10 }}>
+              <StatusPill
+                text={
+                  error
+                    ? `Ошибка: ${error}`
+                    : connected
+                    ? "Подключено"
+                    : connecting
+                    ? "Подключение…"
+                    : "Готов к подключению"
+                }
+                tone={error ? "danger" : connected ? "ok" : connecting ? "warn" : "idle"}
+              />
+              <span style={{ marginLeft: 10, fontSize: 12, color: "#7A8198" }}>
+                {lastEvent}
+              </span>
             </div>
           </div>
 
-          <div style={styles.miniRow}>
-            <button style={styles.miniBtn} onClick={addDemoYou}>
-              + Реплика (Вы)
-            </button>
-            <button style={styles.miniBtn} onClick={addDemoClient}>
-              + Реплика (Клиент)
-            </button>
-          </div>
-
-          <div style={styles.smallHint}>
-            Для автотранскрибации агент должен слать data-сообщения в формате JSON:{" "}
-            <code style={styles.code}>
-              {"{type:'transcript', role:'client', text:'...', t:'12:34:56'}"}
-            </code>
-          </div>
-        </section>
-
-        <section style={styles.panel}>
-          <div style={styles.panelTitle}>Транскрибация</div>
-
-          <div style={styles.transcript}>
-            {transcript.map((m, i) => (
-              <div
-                key={i}
+          <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+            {!connected ? (
+              <button
+                onClick={connect}
+                disabled={connecting}
                 style={{
-                  ...styles.msg,
-                  alignItems: m.role === "you" ? "flex-end" : "flex-start",
+                  height: 44,
+                  padding: "0 16px",
+                  borderRadius: 14,
+                  border: "1px solid #2E6BFF",
+                  background: "#2E6BFF",
+                  color: "#fff",
+                  fontWeight: 900,
+                  cursor: connecting ? "not-allowed" : "pointer",
+                  boxShadow: "0 10px 22px rgba(46,107,255,0.18)",
                 }}
               >
+                Подключиться
+              </button>
+            ) : (
+              <button
+                onClick={disconnect}
+                style={{
+                  height: 44,
+                  padding: "0 16px",
+                  borderRadius: 14,
+                  border: "1px solid #F04438",
+                  background: "#F04438",
+                  color: "#fff",
+                  fontWeight: 900,
+                  cursor: "pointer",
+                  boxShadow: "0 10px 22px rgba(240,68,56,0.18)",
+                }}
+              >
+                Завершить
+              </button>
+            )}
+
+            <button
+              onClick={toggleMic}
+              disabled={!connected}
+              style={{
+                height: 44,
+                padding: "0 14px",
+                borderRadius: 14,
+                border: "1px solid #ECEEF5",
+                background: !connected ? "#F1F3F8" : "#fff",
+                color: !connected ? "#98A2B3" : "#111827",
+                fontWeight: 900,
+                cursor: !connected ? "not-allowed" : "pointer",
+              }}
+            >
+              Микрофон: {micOn ? "Вкл" : "Выкл"}
+            </button>
+          </div>
+        </div>
+
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 14 }}>
+          <Panel title="Сеанс">
+            <div
+              style={{
+                border: "2px dashed #D9DDEB",
+                borderRadius: 16,
+                height: 360,
+                background: "linear-gradient(180deg,#FAFBFF,#F3F5FF)",
+                display: "grid",
+                placeItems: "center",
+                color: "#667085",
+              }}
+            >
+              <div style={{ textAlign: "center" }}>
+                <div style={{ fontSize: 40 }}>🎧</div>
+                <div style={{ marginTop: 10, fontWeight: 800 }}>
+                  {connected
+                    ? "Вы в комнате. Говорите — агент должен отвечать."
+                    : "Подключитесь, чтобы начать звонок."}
+                </div>
+
                 <div
                   style={{
-                    ...styles.bubble,
-                    background:
-                      m.role === "you"
-                        ? "rgba(37, 99, 235, 0.12)"
-                        : "rgba(15, 23, 42, 0.06)",
-                    borderColor:
-                      m.role === "you"
-                        ? "rgba(37, 99, 235, 0.25)"
-                        : "rgba(15, 23, 42, 0.10)",
+                    marginTop: 12,
+                    display: "flex",
+                    gap: 10,
+                    justifyContent: "center",
                   }}
                 >
-                  <div style={styles.meta}>
-                    <span style={{ fontWeight: 700 }}>
-                      {m.role === "you" ? "Вы" : "Клиент"}
-                    </span>
-                    <span style={{ opacity: 0.6 }}>{m.t}</span>
-                  </div>
-                  <div style={styles.text}>{m.text}</div>
+                  <MiniStat label="DataChannel" value={dataChannelReady ? "OK" : "нет"} ok={dataChannelReady} />
+                  <MiniStat label="Remote audio" value={remoteAudioPresent ? "есть" : "нет"} ok={remoteAudioPresent} />
+                  <MiniStat label="Mic" value={micOn ? "вкл" : "выкл"} ok={micOn} />
                 </div>
               </div>
-            ))}
-          </div>
+            </div>
 
-          <div style={styles.hint}>
-            Следующий шаг: запустить агента, который подключится в эту же комнату
-            и будет слать транскрипт через data channel.
-          </div>
-        </section>
+            <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+              <button
+                onClick={() => pushTranscript("manager", "Тестовая реплика менеджера (UI)")}
+                style={ghostBtn}
+              >
+                + Реплика (Вы)
+              </button>
+              <button
+                onClick={() => pushTranscript("client", "Тестовая реплика клиента (UI)")}
+                style={ghostBtn}
+              >
+                + Реплика (Клиент)
+              </button>
+              <button
+                onClick={() => router.push("/trainer")}
+                style={{ ...ghostBtn, marginLeft: "auto" }}
+              >
+                Назад
+              </button>
+            </div>
+
+            <div style={{ marginTop: 10, fontSize: 12, color: "#7A8198" }}>
+              Для автотранскрибации агент должен слать data-сообщения JSON:
+              <br />
+              <code style={{ background: "#F6F7FB", padding: "2px 6px", borderRadius: 8 }}>
+                {"{type:'transcript', role:'client'|'manager', text:'...', t:'12:34:56'}"}
+              </code>
+            </div>
+          </Panel>
+
+          <Panel title="Транскрибация">
+            <div style={{ display: "flex", flexDirection: "column", gap: 10 }}>
+              {transcript.map((m) => (
+                <Message key={m.id} role={m.role} text={m.text} t={m.t} />
+              ))}
+            </div>
+
+            <div style={{ marginTop: 16, fontSize: 12, color: "#7A8198" }}>
+              Следующий шаг: агент должен подключиться в эту же комнату и отправлять транскрипт через data channel.
+            </div>
+          </Panel>
+        </div>
       </div>
-    </main>
+    </div>
   );
 }
 
-const styles: Record<string, React.CSSProperties> = {
-  header: {
-    display: "flex",
-    gap: 16,
-    alignItems: "center",
-    justifyContent: "space-between",
-    marginBottom: 12,
-  },
-  hTitle: { fontSize: 26, fontWeight: 800, letterSpacing: -0.3 },
-  hSub: { color: "rgba(15,23,42,0.65)", fontSize: 13, marginTop: 4 },
-  actions: { display: "flex", gap: 10, alignItems: "center" },
-  statusRow: { display: "flex", gap: 10, flexWrap: "wrap", marginBottom: 16 },
-  pill: {
-    display: "inline-flex",
-    padding: "8px 12px",
-    borderRadius: 999,
-    border: "1px solid rgba(15,23,42,0.10)",
-    background: "rgba(255,255,255,0.65)",
-    backdropFilter: "blur(10px)",
-    fontSize: 12,
-    color: "rgba(15,23,42,0.75)",
-  },
-  errPill: {
-    display: "inline-flex",
-    padding: "8px 12px",
-    borderRadius: 999,
-    border: "1px solid rgba(239,68,68,0.25)",
-    background: "rgba(239,68,68,0.08)",
-    fontSize: 12,
-    color: "rgba(127,29,29,0.95)",
-  },
-  grid: {
-    display: "grid",
-    gridTemplateColumns: "1.05fr 0.95fr",
-    gap: 16,
-  },
-  panel: {
-    background: "rgba(255,255,255,0.78)",
-    border: "1px solid rgba(15,23,42,0.10)",
-    borderRadius: 18,
-    boxShadow: "0 10px 25px rgba(2,6,23,0.07)",
-    backdropFilter: "blur(10px)",
-    padding: 16,
-    minHeight: 520,
-  },
-  panelTitle: { fontWeight: 800, marginBottom: 12 },
-  callStage: {
-    borderRadius: 16,
-    border: "1px dashed rgba(15,23,42,0.16)",
-    background:
-      "linear-gradient(135deg, rgba(37,99,235,0.06), rgba(255,255,255,0.30))",
-    height: 360,
-    display: "flex",
-    alignItems: "center",
-    justifyContent: "center",
-    flexDirection: "column",
-    gap: 10,
-    padding: 16,
-  },
-  avatarBig: { fontSize: 56 },
-  stageText: {
-    color: "rgba(15,23,42,0.65)",
-    textAlign: "center",
-    maxWidth: 420,
-  },
-  transcript: {
-    height: 420,
-    overflow: "auto",
-    padding: 6,
-    display: "flex",
-    flexDirection: "column",
-    gap: 10,
-  },
-  msg: { display: "flex" },
-  bubble: {
-    maxWidth: "88%",
-    borderRadius: 16,
-    border: "1px solid rgba(15,23,42,0.10)",
-    padding: "10px 12px",
-  },
-  meta: {
-    display: "flex",
-    justifyContent: "space-between",
-    gap: 12,
-    fontSize: 11,
-    marginBottom: 6,
-    color: "rgba(15,23,42,0.72)",
-  },
-  text: { fontSize: 14, lineHeight: 1.35, color: "rgba(15,23,42,0.92)" },
-  hint: {
-    marginTop: 10,
-    fontSize: 12,
-    color: "rgba(15,23,42,0.55)",
-  },
-  primaryBtn: {
-    border: "none",
-    borderRadius: 14,
-    padding: "12px 16px",
-    fontWeight: 800,
-    color: "#fff",
-    background: "#2563eb",
-    boxShadow: "0 12px 28px rgba(37,99,235,0.30)",
-    cursor: "pointer",
-  },
-  secondaryBtn: {
-    borderRadius: 14,
-    padding: "12px 16px",
-    fontWeight: 800,
-    background: "rgba(255,255,255,0.75)",
-    border: "1px solid rgba(15,23,42,0.12)",
-    cursor: "pointer",
-  },
-  dangerBtn: {
-    border: "none",
-    borderRadius: 14,
-    padding: "12px 16px",
-    fontWeight: 800,
-    color: "#fff",
-    background: "rgba(239,68,68,0.95)",
-    boxShadow: "0 10px 22px rgba(239,68,68,0.22)",
-    cursor: "pointer",
-  },
-  miniRow: { display: "flex", gap: 10, marginTop: 12, flexWrap: "wrap" },
-  miniBtn: {
-    borderRadius: 12,
-    padding: "10px 12px",
-    fontWeight: 700,
-    background: "rgba(15,23,42,0.04)",
-    border: "1px solid rgba(15,23,42,0.10)",
-    cursor: "pointer",
-  },
-  smallHint: { marginTop: 12, fontSize: 12, color: "rgba(15,23,42,0.62)" },
-  code: {
-    fontFamily:
-      "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
-    fontSize: 11,
-    padding: "2px 6px",
-    borderRadius: 10,
-    background: "rgba(15,23,42,0.06)",
-    border: "1px solid rgba(15,23,42,0.10)",
-  },
+function Panel({ title, children }: { title: string; children: React.ReactNode }) {
+  return (
+    <div
+      style={{
+        background: "#fff",
+        border: "1px solid #ECEEF5",
+        borderRadius: 18,
+        padding: 14,
+        boxShadow: "0 14px 30px rgba(16,24,40,0.06)",
+      }}
+    >
+      <div style={{ fontSize: 18, fontWeight: 900, marginBottom: 12 }}>{title}</div>
+      {children}
+    </div>
+  );
+}
+
+function StatusPill({
+  text,
+  tone,
+}: {
+  text: string;
+  tone: "ok" | "warn" | "danger" | "idle";
+}) {
+  const bg =
+    tone === "ok"
+      ? "#E9FBF0"
+      : tone === "warn"
+      ? "#FFF7E6"
+      : tone === "danger"
+      ? "#FFE8E8"
+      : "#F1F3F8";
+  const fg =
+    tone === "ok"
+      ? "#1A7F3E"
+      : tone === "warn"
+      ? "#B54708"
+      : tone === "danger"
+      ? "#B42318"
+      : "#667085";
+
+  return (
+    <span
+      style={{
+        display: "inline-flex",
+        alignItems: "center",
+        gap: 8,
+        padding: "7px 10px",
+        borderRadius: 999,
+        background: bg,
+        color: fg,
+        border: "1px solid #ECEEF5",
+        fontSize: 12,
+        fontWeight: 900,
+      }}
+    >
+      ● {text}
+    </span>
+  );
+}
+
+function MiniStat({ label, value, ok }: { label: string; value: string; ok: boolean }) {
+  return (
+    <div
+      style={{
+        borderRadius: 999,
+        padding: "7px 10px",
+        background: ok ? "#EAF0FF" : "#F1F3F8",
+        border: "1px solid #ECEEF5",
+        fontSize: 12,
+        fontWeight: 900,
+        color: ok ? "#2E6BFF" : "#667085",
+      }}
+    >
+      {label}: {value}
+    </div>
+  );
+}
+
+function Message({ role, text, t }: { role: Role; text: string; t?: string }) {
+  const isClient = role === "client";
+  const header = role === "client" ? "Клиент" : role === "manager" ? "Вы" : "Система";
+
+  return (
+    <div
+      style={{
+        maxWidth: "92%",
+        alignSelf: isClient ? "flex-start" : "flex-end",
+        background: isClient ? "#F1F3F8" : "#EAF0FF",
+        border: "1px solid #ECEEF5",
+        borderRadius: 14,
+        padding: 10,
+      }}
+    >
+      <div
+        style={{
+          display: "flex",
+          gap: 10,
+          alignItems: "center",
+          marginBottom: 4,
+          color: "#667085",
+          fontSize: 12,
+          fontWeight: 800,
+        }}
+      >
+        <span>{header}</span>
+        <span style={{ marginLeft: "auto", fontWeight: 700 }}>{t ?? ""}</span>
+      </div>
+      <div style={{ fontSize: 14, fontWeight: 700, color: "#111827" }}>{text}</div>
+    </div>
+  );
+}
+
+const ghostBtn: React.CSSProperties = {
+  height: 40,
+  padding: "0 12px",
+  borderRadius: 12,
+  border: "1px solid #ECEEF5",
+  background: "#fff",
+  fontWeight: 900,
+  cursor: "pointer",
 };
